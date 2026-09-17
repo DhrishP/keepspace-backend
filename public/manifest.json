@@ -1,0 +1,18 @@
+{
+  "short_name": "KeepSpace",
+  "name": "KeepSpace - Premium PWA Document Vault",
+  "icons": [
+    {
+      "src": "/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#0d0f12",
+  "theme_color": "#3b82f6",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "description": "Premium secure document vault for PDFs, images, videos, and links built with Cloudflare D1 and R2."
+}
