@@ -809,25 +809,76 @@ api.get('/public/documents/:id', async (c) => {
 
 api.get('/search', async (c) => {
   const db = c.env.DB;
-  const query = c.req.query('q') || '';
+  const query = (c.req.query('q') || '').trim();
+  const typeFilter = (c.req.query('type') || 'all').toLowerCase();
   
-  if (!query.trim()) {
-    return c.json({ folders: [], documents: [] });
+  // If query is empty, return items matching the typeFilter (or all)
+  if (!query) {
+    let folders: any[] = [];
+    if (typeFilter === 'all' || typeFilter === 'folder') {
+      const foldersRes = await db.prepare("SELECT * FROM folders ORDER BY name ASC").all();
+      folders = foldersRes.results || [];
+    }
+
+    let documents: any[] = [];
+    if (typeFilter === 'folder') {
+      documents = [];
+    } else if (typeFilter === 'all') {
+      const docsRes = await db.prepare("SELECT * FROM documents ORDER BY created_at DESC").all();
+      documents = (docsRes.results || []) as any[];
+    } else {
+      const docsRes = await db.prepare("SELECT * FROM documents WHERE type = ? ORDER BY created_at DESC").bind(typeFilter).all();
+      documents = (docsRes.results || []) as any[];
+    }
+
+    for (const doc of documents) {
+      if (doc.type === 'link') {
+        try {
+          doc.url = await decryptString(doc.url);
+        } catch (e) {
+          console.error("Failed to decrypt link URL: ", e);
+        }
+      }
+    }
+
+    return c.json({ folders, documents });
   }
-  
-  const likePattern = `%${query.trim()}%`;
-  
-  const matchedFolders = await db
-    .prepare("SELECT * FROM folders WHERE name LIKE ? ORDER BY name ASC")
-    .bind(likePattern)
-    .all();
-    
-  const matchedDocsQuery = await db
-    .prepare("SELECT * FROM documents WHERE name LIKE ? OR description LIKE ? OR extracted_text LIKE ? ORDER BY created_at DESC")
-    .bind(likePattern, likePattern, likePattern)
-    .all();
-    
-  const documents = matchedDocsQuery.results as any[];
+
+  // Multi-term query matching
+  const terms = query.split(/\s+/).filter(Boolean);
+
+  let folders: any[] = [];
+  if (typeFilter === 'all' || typeFilter === 'folder') {
+    const folderWhere = terms.map(() => "name LIKE ?").join(" AND ");
+    const folderParams = terms.map(t => `%${t}%`);
+    const matchedFolders = await db
+      .prepare(`SELECT * FROM folders WHERE ${folderWhere} ORDER BY name ASC`)
+      .bind(...folderParams)
+      .all();
+    folders = matchedFolders.results || [];
+  }
+
+  let documents: any[] = [];
+  if (typeFilter !== 'folder') {
+    const docWhereParts = terms.map(() => "(name LIKE ? OR description LIKE ? OR extracted_text LIKE ?)");
+    const docParams: any[] = [];
+    terms.forEach(t => {
+      const p = `%${t}%`;
+      docParams.push(p, p, p);
+    });
+
+    let docSql = "";
+    if (typeFilter !== 'all') {
+      docSql = `SELECT * FROM documents WHERE type = ? AND (${docWhereParts.join(" AND ")}) ORDER BY created_at DESC`;
+      docParams.unshift(typeFilter);
+    } else {
+      docSql = `SELECT * FROM documents WHERE ${docWhereParts.join(" AND ")} ORDER BY created_at DESC`;
+    }
+
+    const matchedDocs = await db.prepare(docSql).bind(...docParams).all();
+    documents = (matchedDocs.results || []) as any[];
+  }
+
   for (const doc of documents) {
     if (doc.type === 'link') {
       try {
@@ -836,12 +887,58 @@ api.get('/search', async (c) => {
         console.error("Failed to decrypt search doc: ", e);
       }
     }
+
+    // Generate snippet if matched inside extracted_text
+    if (doc.extracted_text && terms.length > 0) {
+      const textLower = doc.extracted_text.toLowerCase();
+      const firstTerm = terms[0].toLowerCase();
+      const matchIdx = textLower.indexOf(firstTerm);
+      if (matchIdx !== -1) {
+        const start = Math.max(0, matchIdx - 25);
+        const end = Math.min(doc.extracted_text.length, matchIdx + firstTerm.length + 35);
+        let snippet = doc.extracted_text.substring(start, end).replace(/\s+/g, ' ').trim();
+        if (start > 0) snippet = '...' + snippet;
+        if (end < doc.extracted_text.length) snippet = snippet + '...';
+        doc.match_snippet = snippet;
+      }
+    }
   }
 
   return c.json({
-    folders: matchedFolders.results,
+    folders,
     documents
   });
+});
+
+api.post('/search/reindex', async (c) => {
+  const db = c.env.DB;
+  const bucket = c.env.BUCKET;
+
+  const docs = await db.prepare("SELECT * FROM documents WHERE extracted_text IS NULL").all();
+  let reindexedCount = 0;
+  const errors: any[] = [];
+
+  for (const doc of docs.results as any[]) {
+    if (doc.type === 'pdf' || (doc.mime_type && doc.mime_type.startsWith('text/'))) {
+      try {
+        const obj = await bucket.get(doc.url);
+        if (obj) {
+          const encBuf = await obj.arrayBuffer();
+          const decBuf = await decryptData(encBuf);
+          const extractedText = await extractSearchableText(doc.type, doc.mime_type, decBuf);
+          if (extractedText && extractedText.trim().length > 0) {
+            await db.prepare("UPDATE documents SET extracted_text = ? WHERE id = ?").bind(extractedText.trim(), doc.id).run();
+            reindexedCount++;
+          }
+        }
+      } catch (e: any) {
+        console.error(`Failed to reindex doc ${doc.id} (${doc.name}):`, e.message);
+        errors.push({ id: doc.id, name: doc.name, error: e.message });
+      }
+    }
+  }
+
+  return c.json({ success: true, reindexedCount, errors });
 });
 
 api.get('/stats', async (c) => {
