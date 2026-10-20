@@ -578,13 +578,14 @@ api.post('/documents', async (c) => {
   }
 });
 
-// Update document details (rename, toggle favorite, edit description, move)
+// Update document details (rename, toggle favorite, edit description, move, update content)
 api.put('/documents/:id', async (c) => {
   const db = c.env.DB;
+  const bucket = c.env.BUCKET;
   const id = c.req.param('id');
-  const body = await c.req.json<{ name?: string; parent_id?: string | null; favorite?: number; description?: string }>();
+  const body = await c.req.json<{ name?: string; parent_id?: string | null; favorite?: number; description?: string; content?: string }>();
   
-  const doc = await db.prepare("SELECT id FROM documents WHERE id = ?").bind(id).first();
+  const doc = await db.prepare("SELECT * FROM documents WHERE id = ?").bind(id).first();
   if (!doc) {
     return c.json({ error: "Document not found" }, 404);
   }
@@ -610,6 +611,26 @@ api.put('/documents/:id', async (c) => {
   if (body.description !== undefined) {
     fields.push("description = ?");
     bindings.push(body.description);
+  }
+  if (body.content !== undefined) {
+    try {
+      const enc = new TextEncoder();
+      const textBuffer = enc.encode(body.content).buffer;
+      const encryptedBuffer = await encryptData(textBuffer);
+
+      await bucket.put(doc.url as string, encryptedBuffer, {
+        httpMetadata: { contentType: (doc.mime_type as string) || 'text/markdown' }
+      });
+
+      fields.push("size = ?");
+      bindings.push(textBuffer.byteLength);
+
+      fields.push("extracted_text = ?");
+      bindings.push(body.content);
+    } catch (e: any) {
+      console.error("Failed to update file content:", e.message);
+      return c.json({ error: "Failed to update content" }, 500);
+    }
   }
   
   if (fields.length === 0) {
