@@ -400,7 +400,19 @@ api.get('/documents/:id', async (c) => {
       console.error("Failed to decrypt link details url: ", e);
     }
   }
-  return c.json(doc);
+  const breadcrumbs = await getBreadcrumbs(db, doc.parent_id);
+  return c.json({
+    ...doc,
+    breadcrumbs
+  });
+});
+
+// Get folder path breadcrumbs by folder ID
+api.get('/folder-path/:id', async (c) => {
+  const db = c.env.DB;
+  const folderId = c.req.param('id');
+  const breadcrumbs = await getBreadcrumbs(db, folderId);
+  return c.json(breadcrumbs);
 });
 
 // Upload document (file multipart or link save)
