@@ -154,20 +154,33 @@ api.use('*', cors());
 
 // Helper: Traverse recursively upwards to build breadcrumbs
 async function getBreadcrumbs(db: D1Database, folderId: string | null): Promise<{ id: string; name: string }[]> {
-  const crumbs: { id: string; name: string }[] = [];
-  let currentId = folderId;
-  
-  while (currentId) {
-    const folder = await db
-      .prepare("SELECT id, name, parent_id FROM folders WHERE id = ?")
-      .bind(currentId)
-      .first<{ id: string; name: string; parent_id: string | null }>();
-      
-    if (!folder) break;
-    crumbs.unshift({ id: folder.id, name: folder.name });
-    currentId = folder.parent_id;
+  if (!folderId) return [];
+  try {
+    const res = await db.prepare(`
+      WITH RECURSIVE crumb_trail AS (
+        SELECT id, name, parent_id, 0 as level FROM folders WHERE id = ?
+        UNION ALL
+        SELECT f.id, f.name, f.parent_id, ct.level + 1 FROM folders f
+        JOIN crumb_trail ct ON f.id = ct.parent_id
+      )
+      SELECT id, name FROM crumb_trail ORDER BY level DESC
+    `).bind(folderId).all<{ id: string; name: string }>();
+    return res.results || [];
+  } catch (e) {
+    console.error("Recursive breadcrumb query failed, falling back:", e);
+    const crumbs: { id: string; name: string }[] = [];
+    let currentId: string | null = folderId;
+    while (currentId) {
+      const folder = await db
+        .prepare("SELECT id, name, parent_id FROM folders WHERE id = ?")
+        .bind(currentId)
+        .first<{ id: string; name: string; parent_id: string | null }>();
+      if (!folder) break;
+      crumbs.unshift({ id: folder.id, name: folder.name });
+      currentId = folder.parent_id;
+    }
+    return crumbs;
   }
-  return crumbs;
 }
 
 // Helper: Recursively find all documents in subfolders to delete them from R2
@@ -203,24 +216,30 @@ async function getDescendantDocuments(db: D1Database, folderId: string): Promise
 // Get root or folder contents
 api.get('/folders', async (c) => {
   const db = c.env.DB;
-  const rootFolders = await db.prepare("SELECT * FROM folders WHERE parent_id IS NULL ORDER BY name ASC").all();
-  const rootDocs = await db.prepare("SELECT * FROM documents WHERE parent_id IS NULL ORDER BY created_at DESC").all();
+  const [rootFoldersRes, rootDocsRes] = await db.batch([
+    db.prepare("SELECT * FROM folders WHERE parent_id IS NULL ORDER BY name ASC"),
+    db.prepare("SELECT * FROM documents WHERE parent_id IS NULL ORDER BY created_at DESC")
+  ]);
   
-  const documents = rootDocs.results as any[];
-  for (const doc of documents) {
-    if (doc.type === 'link') {
-      try {
-        doc.url = await decryptString(doc.url);
-      } catch (e) {
-        console.error("Link URL decryption failed: ", e);
+  const subfolders = (rootFoldersRes.results || []) as any[];
+  const documents = (rootDocsRes.results || []) as any[];
+  
+  await Promise.all(
+    documents.map(async (doc) => {
+      if (doc.type === 'link') {
+        try {
+          doc.url = await decryptString(doc.url);
+        } catch (e) {
+          console.error("Link URL decryption failed: ", e);
+        }
       }
-    }
-  }
+    })
+  );
 
   return c.json({
     folder: null,
     breadcrumbs: [],
-    subfolders: rootFolders.results,
+    subfolders,
     documents
   });
 });
@@ -229,34 +248,46 @@ api.get('/folders/:id', async (c) => {
   const db = c.env.DB;
   const folderId = c.req.param('id');
   
-  const folder = await db
-    .prepare("SELECT * FROM folders WHERE id = ?")
-    .bind(folderId)
-    .first<{ id: string; name: string; parent_id: string | null }>();
+  const [folderRes, breadcrumbsRes, subfoldersRes, documentsRes] = await db.batch([
+    db.prepare("SELECT * FROM folders WHERE id = ?").bind(folderId),
+    db.prepare(`
+      WITH RECURSIVE crumb_trail AS (
+        SELECT id, name, parent_id, 0 as level FROM folders WHERE id = ?
+        UNION ALL
+        SELECT f.id, f.name, f.parent_id, ct.level + 1 FROM folders f
+        JOIN crumb_trail ct ON f.id = ct.parent_id
+      )
+      SELECT id, name FROM crumb_trail ORDER BY level DESC
+    `).bind(folderId),
+    db.prepare("SELECT * FROM folders WHERE parent_id = ? ORDER BY name ASC").bind(folderId),
+    db.prepare("SELECT * FROM documents WHERE parent_id = ? ORDER BY created_at DESC").bind(folderId)
+  ]);
     
+  const folder = (folderRes.results[0] || null) as { id: string; name: string; parent_id: string | null } | null;
   if (!folder) {
     return c.json({ error: "Folder not found" }, 404);
   }
   
-  const breadcrumbs = await getBreadcrumbs(db, folderId);
-  const subfolders = await db.prepare("SELECT * FROM folders WHERE parent_id = ? ORDER BY name ASC").bind(folderId).all();
-  const documentsQuery = await db.prepare("SELECT * FROM documents WHERE parent_id = ? ORDER BY created_at DESC").bind(folderId).all();
+  const breadcrumbs = (breadcrumbsRes.results || []) as { id: string; name: string }[];
+  const subfolders = (subfoldersRes.results || []) as any[];
+  const documents = (documentsRes.results || []) as any[];
   
-  const documents = documentsQuery.results as any[];
-  for (const doc of documents) {
-    if (doc.type === 'link') {
-      try {
-        doc.url = await decryptString(doc.url);
-      } catch (e) {
-        console.error("Link URL decryption failed: ", e);
+  await Promise.all(
+    documents.map(async (doc) => {
+      if (doc.type === 'link') {
+        try {
+          doc.url = await decryptString(doc.url);
+        } catch (e) {
+          console.error("Link URL decryption failed: ", e);
+        }
       }
-    }
-  }
+    })
+  );
 
   return c.json({
     folder,
     breadcrumbs,
-    subfolders: subfolders.results,
+    subfolders,
     documents
   });
 });
@@ -747,6 +778,7 @@ api.get('/documents/:id/download', async (c) => {
     `${isDownload ? 'attachment' : 'inline'}; filename="${safeAsciiName}"; filename*=UTF-8''${encodedName}`
   );
   headers.set('Content-Type', doc.mime_type || 'application/octet-stream');
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
   
   let finalBody: ArrayBuffer | ReadableStream = object.body;
   
@@ -845,6 +877,7 @@ api.get('/public/documents/:id', async (c) => {
     `${isDownload ? 'attachment' : 'inline'}; filename="${safeAsciiName}"; filename*=UTF-8''${encodedName}`
   );
   headers.set('Content-Type', doc.mime_type || 'application/octet-stream');
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
   
   let finalBody: ArrayBuffer | ReadableStream = object.body;
   
