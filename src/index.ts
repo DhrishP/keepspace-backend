@@ -261,6 +261,17 @@ api.get('/folders/:id', async (c) => {
   });
 });
 
+// Fast endpoint to get direct subfolders of a folder (for hover preview)
+api.get('/folders/:id/subfolders', async (c) => {
+  const db = c.env.DB;
+  const folderId = c.req.param('id');
+  const subfolders = await db
+    .prepare("SELECT id, name, parent_id, created_at FROM folders WHERE parent_id = ? ORDER BY name ASC")
+    .bind(folderId)
+    .all();
+  return c.json(subfolders.results || []);
+});
+
 // Get all folders (flat list)
 api.get('/all-folders', async (c) => {
   const db = c.env.DB;
