@@ -399,8 +399,21 @@ api.delete('/folders/:id', async (c) => {
 // Get document details
 api.get('/documents/:id', async (c) => {
   const db = c.env.DB;
-  const docId = c.req.param('id');
-  const doc = await db.prepare("SELECT * FROM documents WHERE id = ?").bind(docId).first<any>();
+  const rawParam = c.req.param('id');
+  
+  // Extract UUID if present in slug parameter (e.g. "creds-40a58d96-0904-4464-aeb4-1983bf306a5c")
+  const uuidMatch = rawParam.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+  const docId = uuidMatch ? uuidMatch[0] : rawParam;
+
+  let doc = await db.prepare("SELECT * FROM documents WHERE id = ?").bind(docId).first<any>();
+  if (!doc) {
+    // If not found by ID, match by file name or prefix (e.g. for "creds" or "aadhar")
+    const cleanPrefix = rawParam.replace(/-[0-9a-fA-F-]+$/, '').replace(/[^a-zA-Z0-9]/g, '');
+    if (cleanPrefix) {
+      doc = await db.prepare("SELECT * FROM documents WHERE name LIKE ? ORDER BY created_at DESC").bind(`%${cleanPrefix}%`).first<any>();
+    }
+  }
+
   if (!doc) {
     return c.json({ error: "Document not found" }, 404);
   }
